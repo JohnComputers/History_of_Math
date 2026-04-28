@@ -13,48 +13,157 @@ document.getElementById('counter-total').textContent = MATHEMATICIANS.length;
 // ============================================================================
 // LOCAL STORAGE — progress tracking
 // ============================================================================
+// ============================================================================
+// DATA STORE — hybrid local + Firebase
+// ----------------------------------------------------------------------------
+// Always writes through localStorage (so the app works signed-out and
+// resilient to Firestore outages). When a user is signed in, changes
+// are additionally pushed to Firestore, and the user doc is the source
+// of truth on sign-in (we merge local → remote on first sign-in so
+// anonymous progress isn't lost).
+// ============================================================================
 const storage = {
-  get(key, def) {
+  // in-memory cache, seeded from localStorage
+  _cache: {
+    favorites: null,
+    mastered: null,
+    quizHistory: null,
+    streak: null,
+    preferences: null
+  },
+
+  _loadLocal(key, def) {
     try { return JSON.parse(localStorage.getItem(key)) ?? def; }
     catch { return def; }
   },
-  set(key, val) { localStorage.setItem(key, JSON.stringify(val)); },
-  // helpers
-  favorites: () => storage.get('cm_favorites', []),
+
+  _writeLocal(key, val) {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* quota etc. */ }
+  },
+
+  // Initialise cache from localStorage (called once at boot)
+  initLocal() {
+    this._cache.favorites = this._loadLocal('cm_favorites', []);
+    this._cache.mastered = this._loadLocal('cm_mastered', []);
+    this._cache.quizHistory = this._loadLocal('cm_quiz_history', []);
+    this._cache.streak = this._loadLocal('cm_streak', { count: 0, lastDate: null });
+    this._cache.preferences = this._loadLocal('cm_preferences', { theme: 'light' });
+  },
+
+  // Getters
+  favorites() { return this._cache.favorites || []; },
+  mastered() { return this._cache.mastered || []; },
+  quizHistory() { return this._cache.quizHistory || []; },
+  streak() { return this._cache.streak || { count: 0, lastDate: null }; },
+  preferences() { return this._cache.preferences || { theme: 'light' }; },
+
+  // Setters (update cache + localStorage + Firestore)
+  _persist(field, value) {
+    this._cache[field] = value;
+    const keys = {
+      favorites: 'cm_favorites',
+      mastered: 'cm_mastered',
+      quizHistory: 'cm_quiz_history',
+      streak: 'cm_streak',
+      preferences: 'cm_preferences'
+    };
+    this._writeLocal(keys[field], value);
+    if (window.cloudSync && window.cloudSync.isSignedIn()) {
+      window.cloudSync.pushField(field, value);
+    }
+  },
+
   toggleFavorite(id) {
-    const favs = storage.favorites();
+    const favs = [...this.favorites()];
     const i = favs.indexOf(id);
     if (i >= 0) favs.splice(i, 1); else favs.push(id);
-    storage.set('cm_favorites', favs);
+    this._persist('favorites', favs);
     return i < 0;
   },
-  mastered: () => storage.get('cm_mastered', []),
+
   toggleMastered(id) {
-    const m = storage.mastered();
+    const m = [...this.mastered()];
     const i = m.indexOf(id);
     if (i >= 0) m.splice(i, 1); else m.push(id);
-    storage.set('cm_mastered', m);
+    this._persist('mastered', m);
     return i < 0;
   },
-  quizHistory: () => storage.get('cm_quiz_history', []),
+
   addQuizResult(mode, score, total) {
-    const hist = storage.quizHistory();
+    const hist = [...this.quizHistory()];
     hist.unshift({ mode, score, total, date: new Date().toISOString() });
-    if (hist.length > 50) hist.pop();
-    storage.set('cm_quiz_history', hist);
-    storage.updateStreak();
+    if (hist.length > 50) hist.length = 50;
+    this._persist('quizHistory', hist);
+    this.updateStreak();
   },
-  streak: () => storage.get('cm_streak', { count: 0, lastDate: null }),
+
   updateStreak() {
     const now = new Date();
     const today = now.toDateString();
-    const s = storage.streak();
+    const s = this.streak();
     if (s.lastDate === today) return;
     const yest = new Date(now.getTime() - 86400000).toDateString();
     const newCount = (s.lastDate === yest) ? s.count + 1 : 1;
-    storage.set('cm_streak', { count: newCount, lastDate: today });
+    this._persist('streak', { count: newCount, lastDate: today });
+  },
+
+  setPreference(key, value) {
+    const p = { ...this.preferences() };
+    p[key] = value;
+    this._persist('preferences', p);
+  },
+
+  // Called by cloudSync when a user signs in — merges local + remote.
+  // Rules: union for sets (favorites, mastered), concat+dedupe+sort for history,
+  // max streak, latest-wins for preferences (except theme: prefer remote if set).
+  mergeFromCloud(cloud) {
+    if (!cloud) return;
+    if (Array.isArray(cloud.favorites)) {
+      this._cache.favorites = [...new Set([...(this._cache.favorites || []), ...cloud.favorites])];
+      this._writeLocal('cm_favorites', this._cache.favorites);
+    }
+    if (Array.isArray(cloud.mastered)) {
+      this._cache.mastered = [...new Set([...(this._cache.mastered || []), ...cloud.mastered])];
+      this._writeLocal('cm_mastered', this._cache.mastered);
+    }
+    if (Array.isArray(cloud.quizHistory)) {
+      const combined = [...(this._cache.quizHistory || []), ...cloud.quizHistory];
+      // dedupe by ISO date string
+      const seen = new Set();
+      const merged = combined.filter(h => {
+        const key = (h.mode || '') + '|' + (h.date || '');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 50);
+      this._cache.quizHistory = merged;
+      this._writeLocal('cm_quiz_history', merged);
+    }
+    if (cloud.streak && typeof cloud.streak.count === 'number') {
+      const local = this._cache.streak || { count: 0, lastDate: null };
+      this._cache.streak = (cloud.streak.count >= local.count) ? cloud.streak : local;
+      this._writeLocal('cm_streak', this._cache.streak);
+    }
+    if (cloud.preferences) {
+      this._cache.preferences = { ...(this._cache.preferences || {}), ...cloud.preferences };
+      this._writeLocal('cm_preferences', this._cache.preferences);
+    }
+  },
+
+  // Dump everything to Firestore on first sign-in (after merge)
+  dumpAll() {
+    return {
+      favorites: this._cache.favorites,
+      mastered: this._cache.mastered,
+      quizHistory: this._cache.quizHistory,
+      streak: this._cache.streak,
+      preferences: this._cache.preferences
+    };
   }
 };
+
+// Seed from localStorage immediately
+storage.initLocal();
 
 // ============================================================================
 // UTILS
@@ -866,7 +975,7 @@ function showQuizResults() {
         <div class="quiz-result-total">${pct}%</div>
         <div class="quiz-result-msg">${msg}</div>
         <div style="margin-top:2rem">
-          <button class="quiz-next-btn" onclick="navigate('#/quiz/${mode}')">Try Again</button>
+          <button class="quiz-next-btn" onclick="retryQuiz('${mode}')">Try Again</button>
           <button class="quiz-next-btn" onclick="navigate('#/quiz')" style="background:transparent;color:var(--burgundy);border:1px solid var(--burgundy);margin-left:0.5rem">Other Modes</button>
         </div>
         <div class="quiz-review-list">
@@ -1101,7 +1210,7 @@ function showMatchingResults() {
           ${perfect ? '<em>Perfectum.</em> Six matches without an error.' : errors < 3 ? '<em>Bene factum.</em> A minor stumble or two.' : '<em>Incipiens.</em> Review the profiles of those you missed.'}
         </div>
         <div style="margin-top:2rem">
-          <button class="quiz-next-btn" onclick="navigate('#/quiz/matching')">New Round</button>
+          <button class="quiz-next-btn" onclick="retryQuiz('matching')">New Round</button>
           <button class="quiz-next-btn" onclick="navigate('#/quiz')" style="background:transparent;color:var(--burgundy);border:1px solid var(--burgundy);margin-left:0.5rem">Other Modes</button>
         </div>
       </div>
@@ -1203,7 +1312,7 @@ function showTimedResults() {
           ${score >= 15 ? '<em>Extraordinarium.</em>' : score >= 10 ? '<em>Velox.</em> Strong pace.' : score >= 5 ? '<em>Discens.</em> Keep drilling.' : '<em>Incipiens.</em> Read a few profiles and try again.'}
         </div>
         <div style="margin-top:2rem">
-          <button class="quiz-next-btn" onclick="navigate('#/quiz/timed')">Another Round</button>
+          <button class="quiz-next-btn" onclick="retryQuiz('timed')">Another Round</button>
           <button class="quiz-next-btn" onclick="navigate('#/quiz')" style="background:transparent;color:var(--burgundy);border:1px solid var(--burgundy);margin-left:0.5rem">Other Modes</button>
         </div>
         ${review.length ? `
@@ -1267,11 +1376,36 @@ function renderStats() {
   const byMode = {};
   hist.forEach(h => { byMode[h.mode] = (byMode[h.mode] || 0) + 1; });
 
+  // Sync status banner
+  let syncBanner = '';
+  if (cloudSync.isSignedIn()) {
+    const u = cloudSync.currentUser;
+    syncBanner = `
+      <div style="padding:1rem 1.2rem;background:rgba(42,157,143,0.1);border:1px solid #2a9d8f;border-radius:2px;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem">
+        <span style="font-size:0.95rem;color:var(--ink)">
+          <strong style="font-family:var(--display);font-size:1.05rem">✓ Signed in</strong> as
+          ${escapeHtml(u.displayName || u.email)}. Your progress syncs automatically across devices.
+        </span>
+      </div>`;
+  } else if (cloudSync.enabled) {
+    syncBanner = `
+      <div style="padding:1rem 1.2rem;background:var(--parchment);border:1px solid var(--gilt);border-radius:2px;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem">
+        <span style="font-size:0.95rem;color:var(--ink)">
+          Your progress is saved in this browser only.
+          <strong><a href="#" onclick="event.preventDefault();authUI.showSignUp()" style="color:var(--burgundy)">Create an account</a></strong>
+          to sync across devices.
+        </span>
+        <button class="btn-primary" style="width:auto;padding:8px 18px;margin:0" onclick="authUI.showSignIn()">Sign in</button>
+      </div>`;
+  }
+
   renderPage(`
     <div class="page-title-block">
       <h1>Study <em>Progress</em></h1>
-      <p class="page-subtitle">Your reading, your mastered cards, your quiz record — stored locally in this browser</p>
+      <p class="page-subtitle">Your reading, your mastered cards, your quiz record${cloudSync.isSignedIn() ? ' — synced to your account' : ' — stored locally in this browser'}</p>
     </div>
+
+    ${syncBanner}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.5rem;margin-bottom:2rem">
       <div class="stats-card">
@@ -1324,7 +1458,7 @@ function renderStats() {
     ` : ''}
 
     <div style="text-align:center;margin-top:3rem">
-      <button class="filter-clear" onclick="if(confirm('Really reset all your study progress? This cannot be undone.')) { localStorage.clear(); renderStats(); }">Reset all progress</button>
+      <button class="filter-clear" onclick="resetAllProgress()">Reset all progress</button>
     </div>
   `);
 }
@@ -1403,13 +1537,517 @@ document.addEventListener('click', e => {
   }
 });
 
+// ============================================================================
+// THEME (dark / light)
+// ============================================================================
+const theme = {
+  current() {
+    return (storage.preferences() && storage.preferences().theme) || 'light';
+  },
+  apply(themeName) {
+    if (themeName === 'dark') {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+    }
+  },
+  toggle() {
+    const next = this.current() === 'dark' ? 'light' : 'dark';
+    storage.setPreference('theme', next);
+    this.apply(next);
+  },
+  init() {
+    this.apply(this.current());
+    const btn = document.getElementById('theme-toggle');
+    if (btn) btn.addEventListener('click', () => this.toggle());
+  }
+};
+
+// ============================================================================
+// FIREBASE CLOUD SYNC
+// ----------------------------------------------------------------------------
+// Initialises Firebase if config is real (not placeholder), wires up auth
+// state listener, and exposes push/pull helpers used by the storage layer.
+// If config is missing or placeholder, everything falls back to local-only.
+// ============================================================================
+const cloudSync = {
+  enabled: false,
+  app: null,
+  auth: null,
+  db: null,
+  currentUser: null,
+  _unsubscribeDoc: null,
+
+  isConfigReal() {
+    const c = window.firebaseConfig;
+    if (!c) return false;
+    // Reject obvious placeholders
+    return c.apiKey && !c.apiKey.includes('YOUR_') && c.projectId && !c.projectId.includes('YOUR_');
+  },
+
+  init() {
+    if (!this.isConfigReal()) {
+      console.info('[Chronica] Firebase config not set — running in local-only mode.');
+      this.enabled = false;
+      // Still initialise auth UI so the button works in local mode (shows a "Set up Firebase" note)
+      authUI.init();
+      return;
+    }
+    if (typeof firebase === 'undefined') {
+      console.warn('[Chronica] Firebase SDK not loaded — falling back to local-only mode.');
+      this.enabled = false;
+      authUI.init();
+      return;
+    }
+    try {
+      this.app = firebase.initializeApp(window.firebaseConfig);
+      this.auth = firebase.auth();
+      this.db = firebase.firestore();
+      this.enabled = true;
+      // Listen for auth state
+      this.auth.onAuthStateChanged(user => this._handleAuthChange(user));
+      authUI.init();
+      console.info('[Chronica] Firebase initialised.');
+    } catch (e) {
+      console.error('[Chronica] Firebase init failed:', e);
+      this.enabled = false;
+      authUI.init();
+    }
+  },
+
+  isSignedIn() { return !!this.currentUser; },
+
+  async _handleAuthChange(user) {
+    this.currentUser = user;
+    if (this._unsubscribeDoc) { this._unsubscribeDoc(); this._unsubscribeDoc = null; }
+
+    if (user) {
+      // Pull their Firestore doc, merge with local, push back
+      try {
+        const ref = this.db.collection('users').doc(user.uid);
+        const snap = await ref.get();
+        if (snap.exists) {
+          const cloud = snap.data();
+          storage.mergeFromCloud(cloud);
+          // Push merged result back so both sides agree
+          await ref.set(storage.dumpAll(), { merge: true });
+        } else {
+          // First sign-in on this account — push local state
+          await ref.set(storage.dumpAll(), { merge: true });
+        }
+        // Apply merged theme immediately
+        theme.apply(theme.current());
+        // Listen for external updates (other devices)
+        this._unsubscribeDoc = ref.onSnapshot(snap => {
+          if (!snap.exists) return;
+          // Only merge if the update didn't come from us right now
+          // (this is best-effort — on multi-device, last-writer wins per field)
+        }, err => console.warn('[Chronica] Firestore listen error:', err));
+      } catch (e) {
+        console.warn('[Chronica] Sync on sign-in failed:', e);
+      }
+    }
+
+    authUI.updateAccountButton();
+    // Re-render current page so the profile buttons etc. reflect any new state
+    if (typeof route === 'function') route();
+  },
+
+  async pushField(field, value) {
+    if (!this.enabled || !this.currentUser) return;
+    try {
+      const ref = this.db.collection('users').doc(this.currentUser.uid);
+      await ref.set({ [field]: value }, { merge: true });
+      authUI.flashSync();
+    } catch (e) {
+      console.warn('[Chronica] Cloud push failed for', field, e);
+    }
+  },
+
+  async signUpEmail(email, password) {
+    if (!this.enabled) throw new Error('Firebase is not configured. See the comment block at the top of index.html for setup instructions.');
+    return this.auth.createUserWithEmailAndPassword(email, password);
+  },
+  async signInEmail(email, password) {
+    if (!this.enabled) throw new Error('Firebase is not configured.');
+    return this.auth.signInWithEmailAndPassword(email, password);
+  },
+  async signInGoogle() {
+    if (!this.enabled) throw new Error('Firebase is not configured.');
+    const provider = new firebase.auth.GoogleAuthProvider();
+    return this.auth.signInWithPopup(provider);
+  },
+  async signOut() {
+    if (!this.enabled) return;
+    return this.auth.signOut();
+  },
+  async resetPassword(email) {
+    if (!this.enabled) throw new Error('Firebase is not configured.');
+    return this.auth.sendPasswordResetEmail(email);
+  }
+};
+
+// Expose globally so storage._persist can check it
+window.cloudSync = cloudSync;
+
+// ============================================================================
+// AUTH UI — modal + account dropdown
+// ============================================================================
+const authUI = {
+  modal: null,
+  content: null,
+  accountBtn: null,
+  accountLabel: null,
+  accountMenu: null,
+  _mode: 'signin',
+  _syncTimeout: null,
+
+  init() {
+    this.modal = document.getElementById('auth-modal');
+    this.content = document.getElementById('auth-content');
+    this.accountBtn = document.getElementById('account-btn');
+    this.accountLabel = document.getElementById('account-label');
+    const closeBtn = document.getElementById('auth-close');
+    closeBtn.addEventListener('click', () => this.close());
+    this.modal.addEventListener('click', e => {
+      if (e.target === this.modal) this.close();
+    });
+    this.accountBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (cloudSync.isSignedIn()) {
+        this.toggleAccountMenu();
+      } else {
+        this.showSignIn();
+      }
+    });
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.account-wrapper') && !e.target.closest('#account-btn')) {
+        this.hideAccountMenu();
+      }
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') this.close();
+    });
+    this.updateAccountButton();
+  },
+
+  updateAccountButton() {
+    const user = cloudSync.currentUser;
+    if (user) {
+      this.accountLabel.textContent = user.displayName ? user.displayName.split(' ')[0] : (user.email ? user.email.split('@')[0] : 'Account');
+    } else {
+      this.accountLabel.textContent = 'Sign in';
+    }
+    this.hideAccountMenu();
+  },
+
+  toggleAccountMenu() {
+    let menu = document.getElementById('account-menu');
+    if (menu && menu.classList.contains('active')) {
+      this.hideAccountMenu();
+      return;
+    }
+    if (menu) menu.remove();
+    const user = cloudSync.currentUser;
+    menu = document.createElement('div');
+    menu.className = 'account-menu active';
+    menu.id = 'account-menu';
+    menu.innerHTML = `
+      <div class="account-menu-header">
+        Signed in as<br><strong>${escapeHtml(user.displayName || user.email || 'user')}</strong>
+      </div>
+      <button class="account-menu-item" id="menu-stats">View progress</button>
+      <button class="account-menu-item" id="menu-signout">Sign out</button>
+    `;
+    // Position near the button
+    const wrapper = this.accountBtn.parentElement;
+    wrapper.classList.add('account-wrapper');
+    wrapper.appendChild(menu);
+    menu.querySelector('#menu-stats').addEventListener('click', () => {
+      this.hideAccountMenu();
+      navigate('#/stats');
+    });
+    menu.querySelector('#menu-signout').addEventListener('click', async () => {
+      this.hideAccountMenu();
+      await cloudSync.signOut();
+    });
+  },
+
+  hideAccountMenu() {
+    const menu = document.getElementById('account-menu');
+    if (menu) menu.remove();
+  },
+
+  open() {
+    this.modal.style.display = 'flex';
+  },
+
+  close() {
+    this.modal.style.display = 'none';
+    this.content.innerHTML = '';
+  },
+
+  showSignIn() {
+    this._mode = 'signin';
+    this.renderAuthForm();
+    this.open();
+  },
+
+  showSignUp() {
+    this._mode = 'signup';
+    this.renderAuthForm();
+    this.open();
+  },
+
+  showReset() {
+    this._mode = 'reset';
+    this.renderAuthForm();
+    this.open();
+  },
+
+  renderAuthForm() {
+    const firebaseReady = cloudSync.enabled;
+    const firebaseNote = firebaseReady ? '' : `
+      <div class="auth-error shown" style="background:rgba(160,117,39,0.12);color:var(--gilt);border-color:var(--gilt)">
+        <strong>Firebase is not configured.</strong> Your progress will still be saved in this browser, but account sync across devices isn't available yet. Open <code>index.html</code> and paste your Firebase config to enable accounts.
+      </div>
+    `;
+
+    if (this._mode === 'reset') {
+      this.content.innerHTML = `
+        <h2 id="auth-title">Reset password</h2>
+        <p class="modal-sub">We'll email you a reset link.</p>
+        ${firebaseNote}
+        <div class="auth-error" id="auth-err"></div>
+        <div class="auth-success" id="auth-ok"></div>
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="email-in" autocomplete="email" required>
+        </div>
+        <button class="btn-primary" id="submit-btn" ${firebaseReady ? '' : 'disabled'}>Send reset email</button>
+        <div class="auth-toggle-link" id="go-signin">Back to sign in</div>
+      `;
+      document.getElementById('submit-btn').addEventListener('click', () => this.handleReset());
+      document.getElementById('go-signin').addEventListener('click', () => this.showSignIn());
+      return;
+    }
+
+    const isSignUp = this._mode === 'signup';
+    this.content.innerHTML = `
+      <h2 id="auth-title">${isSignUp ? 'Create an account' : 'Welcome back'}</h2>
+      <p class="modal-sub">${isSignUp ? 'Save your progress across devices' : 'Sign in to sync your progress'}</p>
+      ${firebaseNote}
+      <div class="auth-error" id="auth-err"></div>
+      <div class="auth-success" id="auth-ok"></div>
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="email-in" autocomplete="email" required>
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="password-in" autocomplete="${isSignUp ? 'new-password' : 'current-password'}" required>
+      </div>
+      <button class="btn-primary" id="submit-btn" ${firebaseReady ? '' : 'disabled'}>
+        ${isSignUp ? 'Create account' : 'Sign in'}
+      </button>
+      ${!isSignUp ? '<div class="auth-toggle-link" id="go-reset" style="font-size:0.78rem">Forgot password?</div>' : ''}
+      <div class="auth-divider">or</div>
+      <button class="btn-secondary" id="google-btn" ${firebaseReady ? '' : 'disabled'}>
+        <svg width="16" height="16" viewBox="0 0 48 48" style="display:inline-block;vertical-align:middle">
+          <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+          <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+          <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+          <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+        </svg>
+        Continue with Google
+      </button>
+      <div class="auth-toggle-link" id="go-toggle">
+        ${isSignUp ? 'Already have an account? Sign in' : 'New here? Create an account'}
+      </div>
+    `;
+    document.getElementById('submit-btn').addEventListener('click', () => this.handleEmailSubmit());
+    document.getElementById('google-btn').addEventListener('click', () => this.handleGoogle());
+    document.getElementById('go-toggle').addEventListener('click', () => {
+      isSignUp ? this.showSignIn() : this.showSignUp();
+    });
+    const reset = document.getElementById('go-reset');
+    if (reset) reset.addEventListener('click', () => this.showReset());
+    // Focus email
+    setTimeout(() => document.getElementById('email-in')?.focus(), 50);
+    // Submit on Enter
+    ['email-in','password-in'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('keydown', e => {
+        if (e.key === 'Enter') this.handleEmailSubmit();
+      });
+    });
+  },
+
+  _showErr(msg) {
+    const err = document.getElementById('auth-err');
+    if (err) {
+      err.textContent = msg;
+      err.classList.add('shown');
+    }
+    const ok = document.getElementById('auth-ok');
+    if (ok) ok.classList.remove('shown');
+  },
+
+  _showOk(msg) {
+    const ok = document.getElementById('auth-ok');
+    if (ok) {
+      ok.textContent = msg;
+      ok.classList.add('shown');
+    }
+    const err = document.getElementById('auth-err');
+    if (err) err.classList.remove('shown');
+  },
+
+  _friendlyError(err) {
+    const code = err && err.code ? err.code : '';
+    const map = {
+      'auth/invalid-email': 'That email address doesn\'t look right.',
+      'auth/user-disabled': 'This account has been disabled.',
+      'auth/user-not-found': 'No account found with that email.',
+      'auth/wrong-password': 'Incorrect password.',
+      'auth/email-already-in-use': 'An account with this email already exists. Try signing in.',
+      'auth/weak-password': 'Password should be at least 6 characters.',
+      'auth/popup-closed-by-user': 'Sign-in window was closed.',
+      'auth/popup-blocked': 'Your browser blocked the sign-in popup. Allow popups and try again.',
+      'auth/network-request-failed': 'Network error. Check your connection.',
+      'auth/too-many-requests': 'Too many attempts. Please wait a moment.',
+      'auth/invalid-credential': 'Invalid email or password.'
+    };
+    return map[code] || (err && err.message) || 'Something went wrong. Please try again.';
+  },
+
+  async handleEmailSubmit() {
+    const email = document.getElementById('email-in')?.value.trim();
+    const pw = document.getElementById('password-in')?.value;
+    if (!email || !pw) { this._showErr('Please fill in both fields.'); return; }
+    const btn = document.getElementById('submit-btn');
+    btn.disabled = true;
+    btn.textContent = this._mode === 'signup' ? 'Creating…' : 'Signing in…';
+    try {
+      if (this._mode === 'signup') {
+        await cloudSync.signUpEmail(email, pw);
+      } else {
+        await cloudSync.signInEmail(email, pw);
+      }
+      this.close();
+    } catch (e) {
+      this._showErr(this._friendlyError(e));
+      btn.disabled = false;
+      btn.textContent = this._mode === 'signup' ? 'Create account' : 'Sign in';
+    }
+  },
+
+  async handleGoogle() {
+    const btn = document.getElementById('google-btn');
+    btn.disabled = true;
+    try {
+      await cloudSync.signInGoogle();
+      this.close();
+    } catch (e) {
+      this._showErr(this._friendlyError(e));
+      btn.disabled = false;
+    }
+  },
+
+  async handleReset() {
+    const email = document.getElementById('email-in')?.value.trim();
+    if (!email) { this._showErr('Please enter your email.'); return; }
+    const btn = document.getElementById('submit-btn');
+    btn.disabled = true;
+    try {
+      await cloudSync.resetPassword(email);
+      this._showOk('Reset email sent. Check your inbox.');
+    } catch (e) {
+      this._showErr(this._friendlyError(e));
+    }
+    btn.disabled = false;
+  },
+
+  flashSync() {
+    clearTimeout(this._syncTimeout);
+    let ind = document.getElementById('sync-indicator');
+    if (!ind) {
+      ind = document.createElement('span');
+      ind.id = 'sync-indicator';
+      ind.className = 'sync-indicator';
+      ind.textContent = '✓ synced';
+      this.accountBtn.parentElement.insertBefore(ind, this.accountBtn);
+    }
+    ind.classList.add('shown');
+    this._syncTimeout = setTimeout(() => ind.classList.remove('shown'), 1500);
+  }
+};
+
+window.authUI = authUI;
+
+// Reset all local progress (and cloud progress if signed in)
+async function resetAllProgress() {
+  const scope = cloudSync.isSignedIn() ? 'this browser AND your account on all devices' : 'this browser';
+  if (!confirm(`Really reset all your study progress? This will clear ${scope}. This cannot be undone.`)) return;
+
+  // Preserve theme preference across reset
+  const currentTheme = storage.preferences().theme;
+
+  // Clear local
+  try {
+    ['cm_favorites', 'cm_mastered', 'cm_quiz_history', 'cm_streak', 'cm_preferences'].forEach(k => localStorage.removeItem(k));
+  } catch {}
+
+  storage.initLocal();
+  // Restore theme
+  storage.setPreference('theme', currentTheme || 'light');
+
+  // Clear cloud if signed in
+  if (cloudSync.isSignedIn()) {
+    try {
+      await cloudSync.db.collection('users').doc(cloudSync.currentUser.uid).set({
+        favorites: [],
+        mastered: [],
+        quizHistory: [],
+        streak: { count: 0, lastDate: null },
+        preferences: { theme: currentTheme || 'light' }
+      }, { merge: true });
+    } catch (e) { console.warn('Cloud reset failed:', e); }
+  }
+
+  renderStats();
+}
+window.resetAllProgress = resetAllProgress;
+
+// Retry a quiz mode — bypasses hashchange (which wouldn't fire when already on that hash)
+function retryQuiz(mode) {
+  // Clear any quiz state
+  currentQuiz = null;
+  matchingState = null;
+  if (timedState && timedState.timerId) clearInterval(timedState.timerId);
+  timedState = null;
+  flashcardDeck = null;
+  flashcardIndex = 0;
+  // Ensure hash is set (for bookmarkability) then render directly
+  const target = `#/quiz/${mode}`;
+  if (window.location.hash !== target) {
+    window.location.hash = target;
+    // route() will be called by hashchange
+  } else {
+    renderQuiz(mode);
+  }
+}
+
 // expose navigate, renderStats, clearSearch globally
 window.navigate = navigate;
 window.renderStats = renderStats;
 window.clearSearch = clearSearch;
 window.exitTimed = exitTimed;
+window.retryQuiz = retryQuiz;
 
 // ============================================================================
 // BOOT
 // ============================================================================
+theme.init();
+cloudSync.init();
 route();
